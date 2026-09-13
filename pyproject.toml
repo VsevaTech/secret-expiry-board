@@ -1,0 +1,24 @@
+[project]
+name = "secret-expiry-board"
+version = "0.1.0"
+description = "Expiry board for certificates, API credentials and integration keys. Stores metadata only - not a secret vault."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N"]
+ignore = ["B008"]  # FastAPI Depends() in defaults
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not network'"
+markers = ["network: live network access (opt-in with -m network)"]
+filterwarnings = ["error::DeprecationWarning:app.*"]

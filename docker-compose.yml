@@ -1,0 +1,17 @@
+services:
+  board:
+    build: .
+    image: secret-expiry-board:latest
+    container_name: secret-expiry-board
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env            # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID live here only
+    environment:
+      DATABASE_URL: sqlite:////data/secret_expiry_board.db
+    volumes:
+      - seb-data:/data
+    restart: unless-stopped
+
+volumes:
+  seb-data:
