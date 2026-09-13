@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secret Expiry Board</title>
+<style>
+  :root{--bg:#0f1420;--card:#171e2e;--line:#273147;--fg:#e6ebf5;--muted:#8b97b1;
+        --healthy:#2fbf71;--soon:#f2a93b;--critical:#ef5350;--expired:#8e24aa;--accent:#4f8cff}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  header h1{margin:0;font-size:20px}
+  header .tag{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+  main{padding:20px 24px;max-width:1300px;margin:0 auto}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+  .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .tile .n{font-size:28px;font-weight:600}
+  .tile .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  .tile.healthy .n{color:var(--healthy)} .tile.expiring_soon .n{color:var(--soon)}
+  .tile.critical .n{color:var(--critical)} .tile.expired .n{color:var(--expired)}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+  button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer}
+  button.secondary{background:var(--card);border:1px solid var(--line);color:var(--fg)}
+  button:disabled{opacity:.5;cursor:wait}
+  .status{display:inline-block;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;color:#fff}
+  .status.healthy{background:var(--healthy)} .status.expiring_soon{background:var(--soon);color:#222}
+  .status.critical{background:var(--critical)} .status.expired{background:var(--expired)}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:0}
+  tr:target td{background:#1f2a44}
+  .muted{color:var(--muted)} .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .forms{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin:24px 0}
+  form.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+  form h3{margin:0 0 10px;font-size:15px}
+  form .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  form .grid .full{grid-column:1/-1}
+  input,select,textarea{width:100%;background:#0f1420;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px}
+  label{font-size:12px;color:var(--muted);display:block;margin-bottom:2px}
+  pre#out{background:#0b0f18;border:1px solid var(--line);border-radius:8px;padding:12px;white-space:pre-wrap;max-height:260px;overflow:auto;font-size:12px}
+  .note{font-size:12px;color:var(--muted);margin-top:8px}
+  .danger{color:var(--critical)}
+  .small{font-size:12px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Secret Expiry Board</h1>
+  <span class="tag">metadata only &middot; not a secret vault</span>
+  <span class="tag">today {{ summary.today }}</span>
+  <span class="tag">reminders: {{ summary.reminder_days|join(', ') }} days</span>
+  <span class="tag">telegram: {% if summary.telegram_configured %}configured{% else %}<span class="danger">not configured (log only)</span>{% endif %}</span>
+  <span class="tag"><a href="/docs">API docs</a></span>
+</header>
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="n">{{ summary.total }}</div><div class="l">tracked</div></div>
+    <div class="tile healthy"><div class="n">{{ summary.healthy }}</div><div class="l">healthy (&gt;30d)</div></div>
+    <div class="tile expiring_soon"><div class="n">{{ summary.expiring_soon }}</div><div class="l">expiring soon (8–30d)</div></div>
+    <div class="tile critical"><div class="n">{{ summary.critical }}</div><div class="l">critical (≤7d)</div></div>
+    <div class="tile expired"><div class="n">{{ summary.expired }}</div><div class="l">expired</div></div>
+  </div>
+
+  <div class="row">
+    <button id="run-check" onclick="act('/api/actions/run-expiry-check','Run expiry check')">▶ Run expiry check</button>
+    <button class="secondary" onclick="act('/api/actions/refresh-tls','Refresh all TLS hosts')">↻ Refresh all TLS</button>
+    <button class="secondary" onclick="location.reload()">Reload</button>
+    <span class="muted small">Manual actions run the same code the scheduler runs. Each reminder is sent once per threshold.</span>
+  </div>
+  <pre id="out" hidden></pre>
+
+  <table>
+    <thead><tr>
+      <th>Status</th><th>Days</th><th>Name</th><th>Provider</th><th>Env</th><th>Owner</th><th>Expiry</th><th>Kind / TLS</th><th>Last reminder</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for c in items %}
+      <tr id="credential-{{ c.id }}">
+        <td><span class="status {{ c.status.value }}">{{ c.status.value.replace('_',' ') }}</span></td>
+        <td class="mono">{{ c.days_remaining }}</td>
+        <td><strong>{{ c.name }}</strong>{% if c.notes %}<div class="muted small">{{ c.notes }}</div>{% endif %}</td>
+        <td>{{ c.provider }}</td>
+        <td>{{ c.environment }}</td>
+        <td>{{ c.owner }}</td>
+        <td class="mono">{{ c.expiry_date }}</td>
+        <td class="small">{{ c.kind.value.replace('_',' ') }}
+          {% if c.tls_hostname %}<div class="mono">{{ c.tls_hostname }}</div>
+            {% if c.tls_issuer %}<div class="muted">{{ c.tls_issuer }}</div>{% endif %}
+            {% if c.tls_last_error %}<div class="danger">{{ c.tls_last_error }}</div>{% endif %}
+          {% endif %}
+        </td>
+        <td class="small">{% if c.last_notified_threshold is not none %}
+            {{ 'EXPIRED' if c.last_notified_threshold == 0 else c.last_notified_threshold ~ 'd' }}
+            <div class="muted">{{ c.last_notified_at.strftime('%Y-%m-%d %H:%M') if c.last_notified_at else '' }}</div>
+          {% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="small">
+          {% if c.tls_hostname %}<button class="secondary" onclick="act('/api/credentials/{{ c.id }}/refresh-tls','Refresh TLS')">↻</button>{% endif %}
+          <button class="secondary" onclick="del({{ c.id }})">✕</button>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="10" class="muted">No credentials yet. Add one below.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="forms">
+    <form class="card" onsubmit="return submitJSON(event,'/api/credentials')">
+      <h3>Add credential (metadata only)</h3>
+      <div class="grid">
+        <div><label>Name</label><input name="name" required placeholder="DocuSign RSA key"></div>
+        <div><label>System / provider</label><input name="provider" required placeholder="DocuSign"></div>
+        <div><label>Environment</label><input name="environment" value="production" required></div>
+        <div><label>Owner</label><input name="owner" required placeholder="platform-team"></div>
+        <div><label>Kind</label><select name="kind">{% for k in kinds %}<option value="{{ k }}">{{ k.replace('_',' ') }}</option>{% endfor %}</select></div>
+        <div><label>Expiry date</label><input name="expiry_date" type="date" required></div>
+        <div class="full"><label>Notes (where it is used, how to rotate — never the secret itself)</label><textarea name="notes" rows="2"></textarea></div>
+      </div>
+      <div class="row" style="margin:12px 0 0"><button>Add</button></div>
+      <div class="note">Do not paste tokens, passwords or private keys here.</div>
+    </form>
+
+    <form class="card" onsubmit="return submitJSON(event,'/api/tls-hosts')">
+      <h3>Add TLS host (auto-fetch certificate expiry)</h3>
+      <div class="grid">
+        <div class="full"><label>Hostname[:port]</label><input name="hostname" required placeholder="api.example.com:443"></div>
+        <div><label>Owner</label><input name="owner" required placeholder="platform-team"></div>
+        <div><label>Environment</label><input name="environment" value="production" required></div>
+        <div class="full"><label>Name (optional)</label><input name="name" placeholder="Partner API certificate"></div>
+      </div>
+      <div class="row" style="margin:12px 0 0"><button>Fetch &amp; add</button></div>
+      <div class="note">Only the public certificate is read over TLS. The expiry date is re-checked on every scheduler run.</div>
+    </form>
+  </div>
+
+  <h3>Recent reminders</h3>
+  <table>
+    <thead><tr><th>Sent (UTC)</th><th>Credential</th><th>Threshold</th><th>Days</th><th>Channel</th><th>Message</th></tr></thead>
+    <tbody>
+    {% for n in recent %}
+      <tr>
+        <td class="mono">{{ n.sent_at.strftime('%Y-%m-%d %H:%M') }}</td>
+        <td><a href="#credential-{{ n.credential_id }}">#{{ n.credential_id }}</a></td>
+        <td>{{ 'EXPIRED' if n.threshold_days == 0 else n.threshold_days ~ (' day' if n.threshold_days == 1 else ' days') }}</td>
+        <td class="mono">{{ n.days_remaining }}</td>
+        <td>{{ n.channel }}</td>
+        <td class="small mono">{{ n.message|striptags }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No reminders sent yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small">Secret Expiry Board v{{ version }} · stores credential metadata only · it is not a secret vault.</p>
+</main>
+<script>
+const out = document.getElementById('out');
+function show(title, data){ out.hidden=false; out.textContent = title + '\n' + JSON.stringify(data, null, 2); }
+async function act(url, title){
+  const btns=[...document.querySelectorAll('button')]; btns.forEach(b=>b.disabled=true);
+  try{ const r=await fetch(url,{method:'POST'}); show(title+' → HTTP '+r.status, await r.json()); setTimeout(()=>location.reload(), 1500); }
+  catch(e){ show(title+' failed', String(e)); } finally{ btns.forEach(b=>b.disabled=false); }
+}
+async function submitJSON(ev, url){
+  ev.preventDefault();
+  const fd=new FormData(ev.target); const body={};
+  for(const [k,v] of fd.entries()){ if(v!=='') body[k]=v; }
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const data=await r.json(); show('POST '+url+' → HTTP '+r.status, data);
+  if(r.ok){ ev.target.reset(); setTimeout(()=>location.reload(), 1200); }
+  return false;
+}
+async function del(id){
+  if(!confirm('Delete credential #'+id+'?')) return;
+  const r=await fetch('/api/credentials/'+id,{method:'DELETE'}); if(r.ok) location.reload(); else show('delete failed', await r.text());
+}
+</script>
+</body>
+</html>
