@@ -7,10 +7,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from html import escape
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import inspect, select, update
+from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm.attributes import set_committed_value
 
-from app.models import Credential, CredentialKind, NotificationLog, utcnow
+from app import ops
+from app.models import Credential, CredentialKind, NotificationLog, RotationEvent, RotationSource, utcnow
 from app.notifier import Notifier
 from app.status import Status, compute_status, days_remaining, due_threshold, should_notify, threshold_label
 from app.tls import TLSCertInfo, TLSProbeError, fetch_certificate, normalize_hostport
@@ -29,6 +31,7 @@ class CheckResult:
     notified: list[dict] = field(default_factory=list)
     skipped_duplicates: int = 0
     failed: list[dict] = field(default_factory=list)
+    last_error: str | None = None  # sanitized reason of the last failed delivery (no URL / token)
 
     def as_dict(self) -> dict:
         return {
@@ -107,6 +110,7 @@ def run_expiry_check(
         text = format_message(cred, days, status, due, base_url)
         if not notifier.send(text):
             result.failed.append({"credential_id": cred.id, "name": cred.name, "threshold": due})
+            result.last_error = getattr(notifier, "last_error", None) or f"{notifier.channel} delivery failed"
             continue  # not recorded -> retried on the next run
         db.add(
             NotificationLog(
@@ -131,19 +135,66 @@ def run_expiry_check(
             }
         )
     db.commit()
+    ops.record_expiry_check(db, result)
     return result
 
 
-def reset_notifications_if_rotated(cred: Credential, new_expiry: date) -> None:
-    """When expiry_date changes (rotation / renewal) reminders must start over."""
-    if cred.expiry_date != new_expiry:
+def reset_notifications_if_rotated(
+    cred: Credential,
+    new_expiry: date,
+    source: RotationSource = RotationSource.manual,
+    *,
+    record_event: bool = True,
+) -> RotationEvent | None:
+    """Apply a new expiry date. If it really changed: restart reminders and record a RotationEvent.
+
+    * same date -> no-op, returns None (repeated PATCH / TLS refresh of the same certificate);
+    * credential not persisted yet -> plain assignment, no event (creation is not a rotation);
+    * persisted credential -> compare-and-swap ``UPDATE ... WHERE expiry_date = <old>`` so two
+      concurrent writers (scheduler + manual action) cannot both record the same rotation.
+    """
+    if cred.expiry_date == new_expiry:
+        return None
+    db = object_session(cred)
+    if db is None or not inspect(cred).persistent:
         cred.expiry_date = new_expiry
         cred.last_notified_threshold = None
         cred.last_notified_at = None
+        return None
+
+    for _ in range(3):
+        old_expiry = cred.expiry_date
+        if old_expiry == new_expiry:
+            return None
+        res = db.execute(
+            update(Credential)
+            .where(Credential.id == cred.id, Credential.expiry_date == old_expiry)
+            .values(expiry_date=new_expiry, last_notified_threshold=None, last_notified_at=None, updated_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        if res.rowcount == 1:
+            set_committed_value(cred, "expiry_date", new_expiry)
+            set_committed_value(cred, "last_notified_threshold", None)
+            set_committed_value(cred, "last_notified_at", None)
+            if not record_event:
+                return None
+            rotation = RotationEvent(
+                credential_id=cred.id, old_expiry_date=old_expiry, new_expiry_date=new_expiry, source=source
+            )
+            db.add(rotation)
+            return rotation
+        # someone else changed expiry_date in the meantime: reload and re-evaluate
+        db.refresh(cred, ["expiry_date"])
+    return None
 
 
 def apply_tls_info(cred: Credential, info: TLSCertInfo) -> None:
-    reset_notifications_if_rotated(cred, info.not_after)
+    # A record whose certificate was never read successfully (first probe failed, expiry was a
+    # placeholder) is *discovered* here, not rotated: no RotationEvent for that first real date.
+    discovered_before = cred.tls_issuer is not None or (
+        cred.tls_last_checked_at is not None and cred.tls_last_error is None
+    )
+    reset_notifications_if_rotated(cred, info.not_after, RotationSource.tls_refresh, record_event=discovered_before)
     cred.tls_last_checked_at = utcnow()
     cred.tls_last_error = None
     cred.tls_issuer = info.issuer
@@ -233,4 +284,6 @@ def refresh_all_tls(db: Session, *, timeout: float = 10.0, fetch=None) -> dict:
             ok += 1
         else:
             failed.append({"credential_id": cred.id, "tls_hostname": cred.tls_hostname, "error": error})
-    return {"refreshed": ok, "failed": failed}
+    result = {"refreshed": ok, "failed": failed}
+    ops.record_tls_refresh(db, result)
+    return result

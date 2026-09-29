@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import CredentialKind
+from app.models import CredentialKind, RotationSource
 from app.status import Status
 
 FORBIDDEN_NOTE_MARKERS = ("BEGIN PRIVATE KEY", "BEGIN RSA PRIVATE KEY", "BEGIN EC PRIVATE KEY")
@@ -95,6 +95,19 @@ class NotificationOut(BaseModel):
     channel: str
     message: str
     sent_at: datetime
+
+
+class RotationOut(BaseModel):
+    """One immutable rotation record. Metadata only - two dates, the source and a timestamp."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    credential_id: int
+    old_expiry_date: date
+    new_expiry_date: date
+    source: RotationSource
+    created_at: datetime
 
 
 class DashboardSummary(BaseModel):
