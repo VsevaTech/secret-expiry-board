@@ -1,6 +1,6 @@
 [project]
 name = "secret-expiry-board"
-version = "0.1.0"
+version = "0.2.0"
 description = "Expiry board for certificates, API credentials and integration keys. Stores metadata only - not a secret vault."
 requires-python = ">=3.11"
 license = { text = "MIT" }

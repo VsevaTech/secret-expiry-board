@@ -6,3 +6,8 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .venv/
+*.ics
+.idea/
+.vscode/
+*.sqlite
+*.sqlite3
