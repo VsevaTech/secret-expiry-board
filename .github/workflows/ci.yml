@@ -18,6 +18,8 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest
+      - name: Lifecycle demo (deterministic, no network)
+        run: python examples/demo_lifecycle.py
 
   docker:
     runs-on: ubuntu-latest
@@ -34,5 +36,12 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"name":"CI smoke","provider":"ci","owner":"ci","expiry_date":"2099-01-01"}'
           curl -fs -X POST http://127.0.0.1:8000/api/actions/run-expiry-check
+          # v0.2: rotation history, readiness, calendar export
+          curl -fs -X PATCH http://127.0.0.1:8000/api/credentials/1 \
+            -H 'Content-Type: application/json' -d '{"expiry_date":"2099-06-01"}'
+          curl -fs http://127.0.0.1:8000/api/credentials/1/rotations | grep -q '"source":"manual"'
+          curl -fs http://127.0.0.1:8000/ready | tee /dev/stderr | grep -q '"status":"healthy"'
+          curl -fs http://127.0.0.1:8000/api/calendar.ics | grep -q 'DTSTART;VALUE=DATE:20990601'
+          curl -fs http://127.0.0.1:8000/credentials/1 | grep -q 'Rotation history'
           docker logs seb
           docker rm -f seb

@@ -5,6 +5,7 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from app import ops
 from app.config import settings
 from app.database import SessionLocal
 from app.notifier import build_notifier
@@ -27,8 +28,9 @@ def scheduled_check() -> None:
             len(result.failed),
             tls["refreshed"],
         )
-    except Exception:  # noqa: BLE001 - keep the scheduler alive
+    except Exception as exc:  # noqa: BLE001 - keep the scheduler alive
         log.exception("scheduled check failed")
+        ops.record_job_error(db, exc)  # surfaces as scheduler=error on /ready
     finally:
         db.close()
 

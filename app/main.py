@@ -13,15 +13,16 @@ from datetime import date
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import schemas
+from app import ops, schemas
+from app.calendar_ics import build_calendar
 from app.config import settings
 from app.database import get_db, init_db
-from app.models import Credential, NotificationLog
+from app.models import Credential, NotificationLog, RotationEvent, RotationSource, utcnow
 from app.notifier import build_notifier
 from app.scheduler import create_scheduler
 from app.service import (
@@ -44,20 +45,23 @@ TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 async def lifespan(app: FastAPI):
     init_db()
     scheduler = None
+    app.state.started_at = utcnow()
     if settings.scheduler_enabled:
         scheduler = create_scheduler()
         scheduler.start()
         log.info("scheduler started: every %s minute(s)", settings.check_interval_minutes)
+    app.state.scheduler = scheduler
     if not settings.telegram_configured:
         log.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set - reminders will be written to the log only")
     yield
     if scheduler:
         scheduler.shutdown(wait=False)
+    app.state.scheduler = None
 
 
 app = FastAPI(
     title="Secret Expiry Board",
-    version="0.1.0",
+    version="0.2.0",
     description="Tracks expiry dates of certificates, API credentials and integration keys. "
     "Stores credential metadata only - it is not a secret vault.",
     lifespan=lifespan,
@@ -126,12 +130,54 @@ def list_out(db: Session, today: date, status: Status | None = None) -> list[sch
     return items
 
 
+def readiness_state(request: Request, db: Session) -> dict:
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        running: bool | None = scheduler.running
+    else:
+        running = False if settings.scheduler_enabled else None
+    return ops.readiness(
+        db,
+        telegram_configured=settings.telegram_configured,
+        scheduler_enabled=settings.scheduler_enabled,
+        scheduler_running=running,
+        interval_minutes=settings.check_interval_minutes,
+        started_at=getattr(request.app.state, "started_at", None),
+    )
+
+
+def rotations_of(db: Session, credential_id: int) -> list[RotationEvent]:
+    return db.scalars(
+        select(RotationEvent)
+        .where(RotationEvent.credential_id == credential_id)
+        .order_by(RotationEvent.created_at, RotationEvent.id)
+    ).all()
+
+
+ROTATION_LABELS = {
+    RotationSource.manual: "Manual rotation",
+    RotationSource.tls_refresh: "TLS certificate renewal detected",
+}
+
+
+def calendar_response(body: str, filename: str) -> Response:
+    return Response(
+        content=body,
+        media_type="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
+    )
+
+
 # ---------------------------------------------------------------- dashboard
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def dashboard(request: Request, db: Session = Depends(get_db)):
     today = today_utc()
     items = list_out(db, today)
     recent = db.scalars(select(NotificationLog).order_by(NotificationLog.sent_at.desc()).limit(20)).all()
+    rotation_counts = dict(
+        db.execute(select(RotationEvent.credential_id, func.count()).group_by(RotationEvent.credential_id)).all()
+    )
+    ready = readiness_state(request, db)
     return TEMPLATES.TemplateResponse(
         request,
         "dashboard.html",
@@ -141,13 +187,51 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             "recent": recent,
             "kinds": [k.value for k in schemas.CredentialKind],
             "version": app.version,
+            "ready": ready,
+            "last_check_ago": ops.ago(ready["scheduler"]["last_expiry_check"], utcnow()),
+            "last_tls_ago": ops.ago(ready["scheduler"]["last_tls_refresh"], utcnow()),
+            "rotation_counts": rotation_counts,
+        },
+    )
+
+
+@app.get("/credentials/{credential_id}", response_class=HTMLResponse, include_in_schema=False)
+def credential_page(credential_id: int, request: Request, db: Session = Depends(get_db)):
+    cred = get_or_404(db, credential_id)
+    notifications = db.scalars(
+        select(NotificationLog)
+        .where(NotificationLog.credential_id == credential_id)
+        .order_by(NotificationLog.sent_at.desc())
+    ).all()
+    return TEMPLATES.TemplateResponse(
+        request,
+        "credential.html",
+        {
+            "c": to_out(cred, today_utc()),
+            "rotations": rotations_of(db, credential_id),
+            "labels": ROTATION_LABELS,
+            "notifications": notifications,
+            "reminder_days": list(settings.reminder_days),
+            "version": app.version,
         },
     )
 
 
 @app.get("/health", tags=["ops"])
 def health():
+    """Liveness only: the process answers. Unchanged since v0.1."""
     return {"status": "ok", "telegram_configured": settings.telegram_configured}
+
+
+@app.get("/ready", tags=["ops"])
+def ready(request: Request, db: Session = Depends(get_db)):
+    """Readiness from already-known state (no Telegram call, no TLS probe).
+
+    ``healthy`` / ``degraded`` -> HTTP 200 (the board keeps serving); ``unhealthy`` (database
+    unreachable) -> HTTP 503. Telegram not configured is a normal mode and stays healthy.
+    """
+    body = readiness_state(request, db)
+    return JSONResponse(body, status_code=503 if body["status"] == ops.UNHEALTHY else 200)
 
 
 # ---------------------------------------------------------------- credentials
@@ -178,7 +262,8 @@ def update_credential(credential_id: int, payload: schemas.CredentialUpdate, db:
     for key, value in data.items():
         setattr(cred, key, value)
     if new_expiry is not None:
-        reset_notifications_if_rotated(cred, new_expiry)
+        # records a RotationEvent (source=manual) only if the date really changes
+        reset_notifications_if_rotated(cred, new_expiry, RotationSource.manual)
     db.commit()
     db.refresh(cred)
     return to_out(cred, today_utc())
@@ -204,6 +289,36 @@ def credential_notifications(credential_id: int, db: Session = Depends(get_db)):
         .where(NotificationLog.credential_id == credential_id)
         .order_by(NotificationLog.sent_at.desc())
     ).all()
+
+
+@app.get(
+    "/api/credentials/{credential_id}/rotations",
+    response_model=list[schemas.RotationOut],
+    tags=["rotations"],
+)
+def credential_rotations(credential_id: int, db: Session = Depends(get_db)):
+    """Immutable rotation history, oldest first. Read-only: there is no API to edit or delete it."""
+    get_or_404(db, credential_id)
+    return rotations_of(db, credential_id)
+
+
+# ---------------------------------------------------------------- calendar
+@app.get("/api/calendar.ics", tags=["calendar"], response_class=Response)
+def calendar_all(db: Session = Depends(get_db)):
+    """All expiry dates as all-day events with VALARM reminders (REMINDER_DAYS). No notes, no secrets."""
+    creds = db.scalars(select(Credential)).all()
+    return calendar_response(
+        build_calendar(creds, settings.reminder_days, base_url=settings.app_base_url), "secret-expiry-board.ics"
+    )
+
+
+@app.get("/api/credentials/{credential_id}/calendar.ics", tags=["calendar"], response_class=Response)
+def calendar_one(credential_id: int, db: Session = Depends(get_db)):
+    cred = get_or_404(db, credential_id)
+    return calendar_response(
+        build_calendar([cred], settings.reminder_days, name=cred.name, base_url=settings.app_base_url),
+        f"credential-{cred.id}.ics",
+    )
 
 
 # ---------------------------------------------------------------- TLS

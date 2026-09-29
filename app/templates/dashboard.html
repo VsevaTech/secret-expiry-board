@@ -44,6 +44,12 @@
   .danger{color:var(--critical)}
   .small{font-size:12px}
   a{color:var(--accent)}
+  .btn{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 14px;font-weight:600;text-decoration:none;display:inline-block}
+  .sys{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin-bottom:20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:6px 20px}
+  .sys h3{grid-column:1/-1;margin:0 0 4px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;display:flex;gap:10px;align-items:center}
+  .sys .k{color:var(--muted);font-size:12px} .sys .v{font-weight:600}
+  .ok{color:var(--healthy)} .warn{color:var(--soon)} .bad{color:var(--critical)}
+  .pill{font-size:11px;border-radius:999px;padding:1px 8px;border:1px solid currentColor;text-transform:none;letter-spacing:0}
 </style>
 </head>
 <body>
@@ -64,9 +70,21 @@
     <div class="tile expired"><div class="n">{{ summary.expired }}</div><div class="l">expired</div></div>
   </div>
 
+  {% set sched = ready.scheduler.status %}
+  {% set tg = ready.telegram.status %}
+  <section class="sys" id="system-status">
+    <h3>System status <span class="pill {{ 'ok' if ready.status == 'healthy' else 'bad' if ready.status == 'unhealthy' else 'warn' }}">{{ ready.status }}</span>
+      <a class="small" href="/ready" style="text-transform:none;letter-spacing:0">/ready</a></h3>
+    <div><div class="k">Scheduler</div><div class="v {{ 'ok' if sched in ('ok','pending','disabled') else 'bad' }}">{{ {'ok':'Healthy','pending':'Waiting for first run','disabled':'Disabled (manual / cron)','stopped':'Stopped','error':'Last run failed','stale':'Stale','unknown':'Unknown'}[sched] }}</div></div>
+    <div><div class="k">Last check</div><div class="v">{{ last_check_ago }}</div></div>
+    <div><div class="k">Telegram</div><div class="v {{ 'bad' if tg == 'failing' else 'ok' if tg == 'configured' else 'muted' }}">{{ {'configured':'Configured','not_configured':'Not configured (log only)','failing':ready.failed_notifications ~ ' undelivered'}[tg] }}</div></div>
+    <div><div class="k">TLS refresh</div><div class="v {{ 'bad' if ready.tls_probe_failures else 'ok' }}">{% if ready.tls_probe_failures %}{{ ready.tls_probe_failures }} failure{{ '' if ready.tls_probe_failures == 1 else 's' }}{% elif ready.tls.hosts %}OK · {{ last_tls_ago }}{% else %}<span class="muted">no TLS hosts</span>{% endif %}</div></div>
+  </section>
+
   <div class="row">
     <button id="run-check" onclick="act('/api/actions/run-expiry-check','Run expiry check')">▶ Run expiry check</button>
     <button class="secondary" onclick="act('/api/actions/refresh-tls','Refresh all TLS hosts')">↻ Refresh all TLS</button>
+    <a class="btn" id="download-calendar" href="/api/calendar.ics">📅 Download calendar</a>
     <button class="secondary" onclick="location.reload()">Reload</button>
     <span class="muted small">Manual actions run the same code the scheduler runs. Each reminder is sent once per threshold.</span>
   </div>
@@ -81,7 +99,9 @@
       <tr id="credential-{{ c.id }}">
         <td><span class="status {{ c.status.value }}">{{ c.status.value.replace('_',' ') }}</span></td>
         <td class="mono">{{ c.days_remaining }}</td>
-        <td><strong>{{ c.name }}</strong>{% if c.notes %}<div class="muted small">{{ c.notes }}</div>{% endif %}</td>
+        <td><strong><a href="/credentials/{{ c.id }}" style="color:inherit">{{ c.name }}</a></strong>
+          {% if rotation_counts.get(c.id) %}<a class="small" href="/credentials/{{ c.id }}#rotation-history">↻ {{ rotation_counts[c.id] }} rotation{{ '' if rotation_counts[c.id] == 1 else 's' }}</a>{% endif %}
+          {% if c.notes %}<div class="muted small">{{ c.notes }}</div>{% endif %}</td>
         <td>{{ c.provider }}</td>
         <td>{{ c.environment }}</td>
         <td>{{ c.owner }}</td>
@@ -98,6 +118,7 @@
           {% else %}<span class="muted">—</span>{% endif %}</td>
         <td class="small">
           {% if c.tls_hostname %}<button class="secondary" onclick="act('/api/credentials/{{ c.id }}/refresh-tls','Refresh TLS')">↻</button>{% endif %}
+          <a class="btn" title="Add expiry to calendar" href="/api/credentials/{{ c.id }}/calendar.ics">📅</a>
           <button class="secondary" onclick="del({{ c.id }})">✕</button>
         </td>
       </tr>
